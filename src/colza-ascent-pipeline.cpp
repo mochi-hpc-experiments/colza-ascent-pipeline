@@ -20,10 +20,11 @@ class AscentPipeline : public colza::Backend {
     public:
 
     AscentPipeline(const colza::PipelineFactoryArgs& args)
-    : m_engine(args.engine)
-    , m_group_id(args.gid)
-    , m_config(args.config) {
-        // TODO
+    : m_engine(args.engine) {
+        if(args.config.contains("ascent_options")) {
+            auto options = args.config["ascent_options"].dump();
+            m_ascent_options.parse(options);
+        }
     }
 
     void updateMonaAddresses(mona_instance_t mona, const std::vector<na_addr_t>& addresses) override {
@@ -47,6 +48,7 @@ class AscentPipeline : public colza::Backend {
         if(ret != 0) {
             throw std::runtime_error("MPI_Register_mona_comm failed");
         }
+        m_ascent_options["mpi_comm"] = MPI_Comm_c2f(m_mpi_comm);
     }
 
     colza::RequestResult<int32_t> start(uint64_t iteration) override {
@@ -63,15 +65,39 @@ class AscentPipeline : public colza::Backend {
     colza::RequestResult<int32_t> stage(const std::string& sender_addr,
             const std::string& dataset_name, uint64_t iteration, uint64_t block_id,
             const std::vector<size_t>& dimensions, const std::vector<int64_t>& offsets,
-            const colza::Type& type, const thallium::bulk& data) override {
+            const colza::Type& type, const thallium::bulk& remote_data) override {
         auto result = colza::RequestResult<int32_t>{};
-        // TODO
+        (void)offsets;
+        (void)type;
+        if(dimensions.size() != 1) {
+            result.error() = "Unexpected number of dimensions";
+            result.success() = false;
+            return result;
+        }
+        // Do RDMA transfer from client
+        auto size = dimensions[0];
+        std::string data_str(size, '\0');
+        std::vector<std::pair<void*, size_t>> segments = {std::make_pair((void*)data_str.data(), size)};
+        auto local_bulk = m_engine.expose(segments, tl::bulk_mode::write_only);
+        auto origin_ep = m_engine.lookup(sender_addr);
+        remote_data.on(origin_ep) >> local_bulk;
+        // Convert into conduit Node
+        conduit::Node data;
+        data.parse(data_str, "conduit_base64_json");
+        // Store data
+        std::lock_guard<tl::mutex> g(m_data_mtx);
+        m_data[iteration][dataset_name].update(std::move(data));
         return result;
     }
 
     colza::RequestResult<int32_t> execute(uint64_t iteration) override {
         auto result = colza::RequestResult<int32_t>{};
-        // TODO
+        ascent::Ascent ascent;
+        ascent.open(m_ascent_options);
+        ascent.publish(m_data[iteration]["mesh"]);
+        conduit::Node a; // actions are actually defined in options (via actions_file)
+        ascent.execute(a);
+        ascent.close();
         return result;
     }
 
@@ -98,8 +124,6 @@ class AscentPipeline : public colza::Backend {
 
     // Mochi setup
     tl::engine     m_engine;
-    ssg_group_id_t m_group_id;
-    json           m_config;
 
     // Collective communication
     CommType m_comm_type    = CommType::MPI;
@@ -109,9 +133,11 @@ class AscentPipeline : public colza::Backend {
     // Data
     std::map<uint64_t,          // iteration
         std::map<std::string,   // dataset name
-            std::map<uint64_t,  // block id
-                conduit::Node>>> m_data;
-    tl::mutex                    m_data_mtx;
+                conduit::Node>> m_data;
+    tl::mutex                   m_data_mtx;
+
+    // Processing
+    conduit::Node m_ascent_options;
 };
 
 COLZA_REGISTER_BACKEND(ascent, AscentPipeline);
