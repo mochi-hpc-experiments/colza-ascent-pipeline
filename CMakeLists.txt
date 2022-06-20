@@ -21,9 +21,11 @@ find_package (colza REQUIRED)
 find_package (MPI REQUIRED)
 find_package (spdlog REQUIRED)
 find_package (Ascent REQUIRED)
+find_package (PkgConfig REQUIRED)
+pkg_check_modules (MONA_MPI REQUIRED IMPORTED_TARGET mona-mpi)
 
 add_library (colza-ascent-pipeline SHARED src/colza-ascent-pipeline.cpp)
-target_link_libraries (colza-ascent-pipeline MPI::MPI_C colza-server spdlog::spdlog ascent::ascent_mpi)
+target_link_libraries (colza-ascent-pipeline MPI::MPI_C colza-server spdlog::spdlog ascent::ascent_mpi PkgConfig::MONA_MPI)
 
 install (TARGETS colza-ascent-pipeline
          EXPORT colza-ascent-pipeline
