@@ -92,7 +92,7 @@ class AscentPipeline : public colza::Backend {
             const std::string& dataset_name, uint64_t iteration, uint64_t block_id,
             const std::vector<size_t>& dimensions, const std::vector<int64_t>& offsets,
             const colza::Type& type, const thallium::bulk& remote_data) override {
-        spdlog::trace("AscentPipeline::stage() called with iteration {}", iteration);
+        spdlog::info("AscentPipeline::stage() called with iteration {}", iteration);
         auto result = colza::RequestResult<int32_t>{};
         (void)offsets;
         (void)type;
@@ -114,20 +114,20 @@ class AscentPipeline : public colza::Backend {
         // Store data
         std::lock_guard<tl::mutex> g(m_data_mtx);
         m_data[iteration][dataset_name].update(std::move(data));
-        spdlog::trace("AscentPipeline::stage() completed iteration {}", iteration);
+        spdlog::info("AscentPipeline::stage() completed iteration {}", iteration);
         return result;
     }
 
     colza::RequestResult<int32_t> execute(uint64_t iteration) override {
         auto result = colza::RequestResult<int32_t>{};
-        spdlog::trace("AscentPipeline::execute() called with iteration {}", iteration);
+        spdlog::info("AscentPipeline::execute() called with iteration {}", iteration);
         ascent::Ascent ascent;
         ascent.open(m_ascent_options);
         ascent.publish(m_data[iteration]["mesh"]);
         conduit::Node a; // actions are actually defined in options (via actions_file)
         ascent.execute(a);
         ascent.close();
-        spdlog::trace("AscentPipeline::execute() completed iteration {}", iteration);
+        spdlog::info("AscentPipeline::execute() completed iteration {}", iteration);
         return result;
     }
 
