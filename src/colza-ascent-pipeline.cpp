@@ -39,6 +39,13 @@ class AscentPipeline : public colza::Backend {
                 throw std::runtime_error("AscentPipeline configuration: comm_type should be \"mona\" or \"mpi\"");
             }
         }
+        if(args.config.contains("log_wrapped_calls")) {
+            if(!args.config["log_wrapped_calls"].is_boolean())
+                throw std::runtime_error("AscentPipeline configuration: log_wrapped_calls should be a boolean");
+            if(args.config["log_wrapped_calls"].get<bool>()) {
+                MPI_Mona_enable_logging();
+            }
+        }
     }
 
     void updateMonaAddresses(mona_instance_t mona, const std::vector<na_addr_t>& addresses) override {
