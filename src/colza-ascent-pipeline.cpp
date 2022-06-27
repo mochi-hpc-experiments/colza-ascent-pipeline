@@ -23,6 +23,12 @@ class AscentPipeline : public colza::Backend {
 
     AscentPipeline(const colza::PipelineFactoryArgs& args)
     : m_engine(args.engine) {
+        int flag;
+        MPI_Initialized(&flag);
+        if(!flag) {
+            MPI_Init(nullptr, nullptr);
+            m_owns_mpi = true;
+        }
         if(args.config.contains("ascent_options")) {
             auto options = args.config["ascent_options"].dump();
             m_ascent_options.parse(options);
@@ -160,6 +166,7 @@ class AscentPipeline : public colza::Backend {
         spdlog::trace("AscentPipeline::destroy() called iteration");
         result.value() = 0;
         result.success() = true;
+        if(m_owns_mpi) MPI_Finalize();
         return result;
     }
 
@@ -178,6 +185,8 @@ class AscentPipeline : public colza::Backend {
     mona_comm_t m_mona_comm        = nullptr;
     mona_comm_t m_mona_comm_latest = nullptr;
     tl::mutex   m_mona_comm_mtx;
+
+    bool m_owns_mpi = false; // whether this pipeline initialized MPI
 
     // Data
     std::map<uint64_t,          // iteration
