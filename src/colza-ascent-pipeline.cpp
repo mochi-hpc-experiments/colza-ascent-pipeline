@@ -6,6 +6,7 @@
 #include <mpi.h>
 #include <ascent.hpp>
 #include <map>
+#include <mutex>
 
 namespace tl = thallium;
 using json = nlohmann::json;
@@ -49,30 +50,15 @@ class AscentPipeline : public colza::Backend {
     }
 
     void updateMonaAddresses(mona_instance_t mona, const std::vector<na_addr_t>& addresses) override {
-        if(m_comm_type == CommType::MPI) {
-            m_mpi_comm = MPI_COMM_WORLD;
-            spdlog::trace("AscentPipeline using MPI_COMM_WORLD");
-            m_ascent_options["mpi_comm"] = MPI_COMM_WORLD;
-            return;
+        std::lock_guard<tl::mutex> g(m_mona_comm_mtx);
+        if(m_mona_comm_latest != nullptr) {
+            mona_comm_free(m_mona_comm_latest);
+            m_mona_comm_latest = nullptr;
         }
-        if(m_mpi_comm != MPI_COMM_NULL) {
-            MPI_Comm_free(&m_mpi_comm);
-            m_mpi_comm = MPI_COMM_NULL;
-        }
-        if(m_mona_comm != nullptr) {
-            mona_comm_free(m_mona_comm);
-            m_mona_comm = nullptr;
-        }
-        auto na_ret = mona_comm_create(mona, addresses.size(), addresses.data(), &m_mona_comm);
+        auto na_ret = mona_comm_create(mona, addresses.size(), addresses.data(), &m_mona_comm_latest);
         if(na_ret != NA_SUCCESS) {
             throw std::runtime_error("mona_comm_create returned error "s + std::to_string((int)na_ret));
         }
-        auto ret = MPI_Register_mona_comm(m_mona_comm, &m_mpi_comm);
-        if(ret != 0) {
-            throw std::runtime_error("MPI_Register_mona_comm failed");
-        }
-        m_ascent_options["mpi_comm"] = MPI_Comm_c2f(m_mpi_comm);
-        spdlog::trace("AscentPipeline::updateMonaAddresses succeeded");
     }
 
     colza::RequestResult<int32_t> start(uint64_t iteration) override {
@@ -80,11 +66,33 @@ class AscentPipeline : public colza::Backend {
         result.value()   = 0;
         result.success() = true;
         spdlog::trace("AscentPipeline::start() called with iteration {}", iteration);
+        if(m_comm_type == CommType::MONA) {
+            std::lock_guard<tl::mutex> g(m_mona_comm_mtx);
+            auto nret = mona_comm_dup(m_mona_comm_latest, &m_mona_comm);
+            if(nret != 0) {
+                throw std::runtime_error("mona_comm_dup failed");
+            }
+            auto ret = MPI_Register_mona_comm(m_mona_comm, &m_mpi_comm);
+            if(ret != 0) {
+                throw std::runtime_error("MPI_Register_mona_comm failed");
+            }
+            m_ascent_options["mpi_comm"] = MPI_Comm_c2f(m_mpi_comm);
+        } else {
+            m_ascent_options["mpi_comm"] = MPI_Comm_c2f(MPI_COMM_WORLD);
+        }
+        spdlog::trace("AscentPipeline::updateMonaAddresses succeeded");
         return result;
     }
 
     void abort(uint64_t iteration) override {
         (void)iteration;
+        if(m_comm_type == CommType::MONA) {
+            if(m_mona_comm) {
+                MPI_Comm_free(&m_mpi_comm);
+                mona_comm_free(m_mona_comm);
+            }
+            m_mona_comm = nullptr;
+        }
         spdlog::trace("AscentPipeline::abort() called with iteration {}", iteration);
     }
 
@@ -92,7 +100,7 @@ class AscentPipeline : public colza::Backend {
             const std::string& dataset_name, uint64_t iteration, uint64_t block_id,
             const std::vector<size_t>& dimensions, const std::vector<int64_t>& offsets,
             const colza::Type& type, const thallium::bulk& remote_data) override {
-        spdlog::info("AscentPipeline::stage() called with iteration {}", iteration);
+        spdlog::trace("AscentPipeline::stage() called with iteration {}", iteration);
         auto result = colza::RequestResult<int32_t>{};
         (void)offsets;
         (void)type;
@@ -114,24 +122,31 @@ class AscentPipeline : public colza::Backend {
         // Store data
         std::lock_guard<tl::mutex> g(m_data_mtx);
         m_data[iteration][dataset_name].update(std::move(data));
-        spdlog::info("AscentPipeline::stage() completed iteration {}", iteration);
+        spdlog::trace("AscentPipeline::stage() completed iteration {}", iteration);
         return result;
     }
 
     colza::RequestResult<int32_t> execute(uint64_t iteration) override {
         auto result = colza::RequestResult<int32_t>{};
-        spdlog::info("AscentPipeline::execute() called with iteration {}", iteration);
+        spdlog::trace("AscentPipeline::execute() called with iteration {}", iteration);
         ascent::Ascent ascent;
         ascent.open(m_ascent_options);
         ascent.publish(m_data[iteration]["mesh"]);
         conduit::Node a; // actions are actually defined in options (via actions_file)
         ascent.execute(a);
         ascent.close();
-        spdlog::info("AscentPipeline::execute() completed iteration {}", iteration);
+        spdlog::trace("AscentPipeline::execute() completed iteration {}", iteration);
         return result;
     }
 
     colza::RequestResult<int32_t> cleanup(uint64_t iteration) override {
+        if(m_comm_type == CommType::MONA) {
+            if(m_mona_comm) {
+                MPI_Comm_free(&m_mpi_comm);
+                mona_comm_free(m_mona_comm);
+            }
+            m_mona_comm = nullptr;
+        }
         auto result = colza::RequestResult<int32_t>{};
         spdlog::trace("AscentPipeline::cleanup() called iteration {}", iteration);
         std::lock_guard<tl::mutex> g(m_data_mtx);
@@ -158,9 +173,11 @@ class AscentPipeline : public colza::Backend {
     tl::engine     m_engine;
 
     // Collective communication
-    CommType m_comm_type    = CommType::MPI;
-    MPI_Comm m_mpi_comm     = MPI_COMM_NULL;
-    mona_comm_t m_mona_comm = nullptr;
+    CommType m_comm_type           = CommType::MPI;
+    MPI_Comm m_mpi_comm            = MPI_COMM_NULL;
+    mona_comm_t m_mona_comm        = nullptr;
+    mona_comm_t m_mona_comm_latest = nullptr;
+    tl::mutex   m_mona_comm_mtx;
 
     // Data
     std::map<uint64_t,          // iteration
